@@ -16,7 +16,7 @@ RUN mkdir -p outputs
 RUN pip install ffmpeg-python
 
 # Install PyTorch
-RUN pip install torch==1.7.0+cu110 torchaudio==0.7.0 -f https://download.pytorch.org/whl/torch_stable.html
+RUN pip install torch==1.7.0+cu110 -f https://download.pytorch.org/whl/torch_stable.html
 
 # Install torchvision
 RUN pip install https://download.pytorch.org/whl/cu110/torchvision-0.8.0-cp38-cp38-linux_x86_64.whl
