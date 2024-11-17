@@ -11,6 +11,7 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from os import path as osp
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
@@ -27,7 +28,6 @@ def get_video_meta_info(video_path):
     ret = {}
     probe = ffmpeg.probe(video_path)
     video_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'video']
-    print(video_streams)
     has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
     ret['width'] = video_streams[0]['width']
     ret['height'] = video_streams[0]['height']
@@ -37,7 +37,6 @@ def get_video_meta_info(video_path):
              float(video_streams[0]['avg_frame_rate'].split('/')[1])
     duration = float(video_streams[0]['tags']['NUMBER_OF_FRAMES-eng'])
     nb_frames = int(frame_rate * duration)
-    # ret['nb_frames'] = int(video_streams[0]['nb_frames'])
     ret['nb_frames'] = nb_frames
     return ret
 
@@ -72,7 +71,7 @@ class Reader:
         if self.input_type.startswith('video'):
             video_path = get_sub_video(args, total_workers, worker_idx)
             self.stream_reader = (
-                ffmpeg.input(video_path).output('pipe:', format='rawvideo', pix_fmt='bgr24',
+                ffmpeg.input(video_path).output('pipe:', format='rawvideo', pix_fmt='rgb24',
                                                 loglevel='error').run_async(
                                                     pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
             meta = get_video_meta_info(video_path)
@@ -150,7 +149,7 @@ class Writer:
 
         if audio is not None:
             self.stream_writer = (
-                ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
+                ffmpeg.input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{out_width}x{out_height}',
                              framerate=fps).output(
                                  audio,
                                  video_save_path,
@@ -161,19 +160,77 @@ class Writer:
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
         else:
             self.stream_writer = (
-                ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
+                ffmpeg.input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{out_width}x{out_height}',
                              framerate=fps).output(
                                  video_save_path, pix_fmt='yuv420p', vcodec='libx264',
                                  loglevel='error').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
-    def write_frame(self, frame):
-        frame = frame.astype(np.uint8).tobytes()
+    def write_frame(self, frame: np.ndarray):
+        assert frame.dtype == np.uint8
+        frame = frame.data
         self.stream_writer.stdin.write(frame)
 
     def close(self):
         self.stream_writer.stdin.close()
         self.stream_writer.wait()
+
+
+
+def convert(self: RealESRGANer, img):
+    img = torch.from_numpy(np.array(np.transpose(img, (2, 0, 1))))
+    img = img.unsqueeze(0).to(self.device)
+    if self.half:
+        img = img.half()
+    else:
+        img = img.float()
+    return img / 255.0
+
+def pre_process_batched(self: RealESRGANer):
+    # pre_pad
+    if self.pre_pad != 0:
+        self.img = F.pad(self.img, (0, self.pre_pad, 0, self.pre_pad), 'reflect')
+    # mod pad for divisible borders
+    if self.scale == 2:
+        self.mod_scale = 2
+    elif self.scale == 1:
+        self.mod_scale = 4
+    if self.mod_scale is not None:
+        self.mod_pad_h, self.mod_pad_w = 0, 0
+        _, _, h, w = self.img.size()
+        if (h % self.mod_scale != 0):
+            self.mod_pad_h = (self.mod_scale - h % self.mod_scale)
+        if (w % self.mod_scale != 0):
+            self.mod_pad_w = (self.mod_scale - w % self.mod_scale)
+        self.img = F.pad(self.img, (0, self.mod_pad_w, 0, self.mod_pad_h), 'reflect')
+
+
+@torch.no_grad()
+def batch_enhance_rgb(self: RealESRGANer, imgs, outscale=None, alpha_upsampler='realesrgan'):
+    tensors = []
+    for img in imgs:
+        # img: numpy
+        if np.max(img) > 256:  # 16-bit image
+            assert False
+        if len(img.shape) == 2:  # gray image
+            assert False
+        elif img.shape[2] == 4:  # RGBA image with alpha channel
+            assert False
+        tensors.append(convert(self, img))
+
+    self.img = torch.cat(tensors)
+    # ------------------- process image (without the alpha channel) ------------------- #
+    pre_process_batched(self)
+    if self.tile_size > 0:
+        self.tile_process()
+    else:
+        self.process()
+    output_img = self.post_process()
+    if outscale is not None and outscale != float(self.scale):
+        output_img = F.interpolate(output_img, scale_factor=outscale / float(self.scale), mode='area')
+    output_img = (output_img * 255).clamp_(0, 255).byte().permute(0, 2, 3, 1).contiguous().cpu().numpy()
+    for output in output_img:
+        yield output
 
 
 def inference_video(args, video_save_path, device=None, total_workers=1, worker_idx=0):
@@ -259,26 +316,32 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
+    queue = []
+    assert not args.face_enhance
     while True:
         img = reader.get_frame()
         if img is None:
             break
-
-        try:
-            if args.face_enhance:
-                _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
+        queue.append(img)
+        if len(queue) == args.batch:
+            try:
+                output = list(batch_enhance_rgb(upsampler, queue, outscale=args.outscale))
+                queue.clear()
+            except RuntimeError as error:
+                print('Error', error)
+                print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
             else:
-                output, _ = upsampler.enhance(img, outscale=args.outscale)
-        except RuntimeError as error:
-            print('Error', error)
-            print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
-        else:
-            writer.write_frame(output)
+                for frame in output:
+                    writer.write_frame(frame)
 
-        # added apple chip mps supports
+                pbar.update(args.batch)
+            torch.cuda.synchronize(device) if torch.cuda.is_available() else torch.mps.synchronize()
+    if len(queue):
+        for frame in batch_enhance_rgb(upsampler, queue, outscale=args.outscale):
+            writer.write_frame(frame)
+            pbar.update(1)
+        queue.clear()
         torch.cuda.synchronize(device) if torch.cuda.is_available() else torch.mps.synchronize()
-        pbar.update(1)
-
     reader.close()
     writer.close()
 
@@ -293,8 +356,8 @@ def run(args):
         os.system(f'ffmpeg -i {args.input} -qscale:v 1 -qmin 1 -qmax 1 -vsync 0  {tmp_frames_folder}/frame%08d.png')
         args.input = tmp_frames_folder
 
-    # added apple chip mps supports
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else torch.mps.device_count()
+
     num_process = num_gpus * args.num_process_per_gpu
     if num_process == 1:
         inference_video(args, video_save_path)
@@ -359,25 +422,29 @@ def main():
     parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for no tile during testing')
     parser.add_argument('--tile_pad', type=int, default=10, help='Tile padding')
     parser.add_argument('--pre_pad', type=int, default=0, help='Pre padding size at each border')
-    parser.add_argument('--face_enhance', action='store_true', help='Use GFPGAN to enhance face')
+    # parser.add_argument('--face_enhance', action='store_true', help='Use GFPGAN to enhance face')
     parser.add_argument(
         '--fp32', action='store_true', help='Use fp32 precision during inference. Default: fp16 (half precision).')
     parser.add_argument('--fps', type=float, default=None, help='FPS of the output video')
     parser.add_argument('--ffmpeg_bin', type=str, default='ffmpeg', help='The path to ffmpeg')
-    parser.add_argument('--extract_frame_first', action='store_true')
+    # parser.add_argument('--extract_frame_first', action='store_true')
     parser.add_argument('--num_process_per_gpu', type=int, default=1)
+    parser.add_argument('--batch', type=int, default=4)
 
-    parser.add_argument(
-        '--alpha_upsampler',
-        type=str,
-        default='realesrgan',
-        help='The upsampler for the alpha channels. Options: realesrgan | bicubic')
-    parser.add_argument(
-        '--ext',
-        type=str,
-        default='auto',
-        help='Image extension. Options: auto | jpg | png, auto means using the same extension as inputs')
+    # parser.add_argument(
+    #     '--alpha_upsampler',
+    #     type=str,
+    #     default='realesrgan',
+    #     help='The upsampler for the alpha channels. Options: realesrgan | bicubic')
+    # parser.add_argument(
+    #     '--ext',
+    #     type=str,
+    #     default='auto',
+    #     help='Image extension. Options: auto | jpg | png, auto means using the same extension as inputs')
     args = parser.parse_args()
+    args.extract_frame_first = False
+    args.face_enhance = False
+    # args.alpha_upsampler = 'bicubic'
 
     args.input = args.input.rstrip('/').rstrip('\\')
     os.makedirs(args.output, exist_ok=True)

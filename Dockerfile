@@ -3,12 +3,6 @@ FROM python:3.8.20-bookworm
 # Fix: ImportError: libGL.so.1: cannot open shared object file: No such file or directory
 RUN apt-get update -y && apt-get -y install ffmpeg libsm6 libxext6
 
-# Copy files from source to the container
-COPY . /Real-ESRGAN
-
-# Set root at Real-ESRGAN
-WORKDIR /Real-ESRGAN
-
 # Create the outputs folder
 RUN mkdir -p outputs
 
@@ -16,19 +10,22 @@ RUN mkdir -p outputs
 RUN pip install ffmpeg-python
 
 # Install PyTorch
-RUN pip install torch==1.7.0+cu110 -f https://download.pytorch.org/whl/torch_stable.html
+RUN pip install torch==1.7.1 -f https://download.pytorch.org/whl/torch_stable.html
 
 # Install torchvision
-RUN pip install https://download.pytorch.org/whl/cu110/torchvision-0.8.0-cp38-cp38-linux_x86_64.whl
-
-# Install basicsr
-RUN pip install basicsr
+RUN pip install https://download.pytorch.org/whl/torchvision-0.17.0-cp38-cp38-linux_aarch64.whl#sha256=e041ce3336364413bab051a3966d884bab25c200f98ca8a065f0abe758c3005e
 
 # Install facexlib
 RUN pip install facexlib
 
 # Install gfpgan
 RUN pip install gfpgan
+
+# Copy files from source to the container
+COPY . /Real-ESRGAN
+
+# Set root at Real-ESRGAN
+WORKDIR /Real-ESRGAN
 
 # Install all remain packages
 RUN pip install -r requirements.txt
